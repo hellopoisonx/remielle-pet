@@ -1,0 +1,1 @@
+var{contextBridge:e,ipcRenderer:t}=require("electron");e.exposeInMainWorld(`electron`,{invoke:(e,...n)=>t.invoke(e,...n),send:(e,...n)=>t.send(e,...n),on:(e,n)=>{let r=(e,...t)=>n(...t);return t.on(e,r),()=>t.removeListener(e,r)}});

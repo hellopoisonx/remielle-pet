@@ -1,0 +1,36 @@
+{
+  "name": "remielle-pet",
+  "version": "0.1.0",
+  "description": "蕾米埃尔桌宠 - 可对话的AI桌宠软件",
+  "main": "dist-electron/main.js",
+  "author": "remielle-pet",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "dist": "vite build && electron-builder --win"
+  },
+  "build": {
+    "appId": "com.remielle.pet",
+    "productName": "remielle-pet",
+    "files": [
+      "dist/**",
+      "dist-electron/**"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "icon": "build/icon.png"
+    }
+  },
+  "dependencies": {
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.8",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
+    "vite": "^8.3.0",
+    "vite-plugin-electron": "^1.1.2"
+  }
+}

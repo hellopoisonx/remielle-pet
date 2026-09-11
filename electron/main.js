@@ -1,0 +1,332 @@
+const { app, BrowserWindow, ipcMain, Menu, screen } = require('electron')
+const path = require('node:path')
+const store = require('./store')
+const settings = require('./settings')
+const { streamChat } = require('./zhipu')
+
+// 静态资源文件名(gif状态 / 表情包)
+const IDLE_GIFS = ['发呆.gif', '思考.gif', '欣赏.gif']
+const APPRECIATE_GIFS = ['欣赏.gif', '自豪.gif']
+const DONE_GIF = '创作并完成.gif'
+const CREATING_GIF = '创作.gif'
+const EMOJIS = [
+  '表情包-哭.png', '表情包-困倦.png', '表情包-坏笑.png', '表情包-害羞.png',
+  '表情包-开心.png', '表情包-惊讶.png', '表情包-生气.png', '表情包-鼓励.png',
+]
+
+const random = arr => arr[Math.floor(Math.random() * arr.length)]
+const randInt = (min, max) => min + Math.floor(Math.random() * (max - min + 1))
+
+let petWin = null
+let homeWin = null
+
+let petGif = random(IDLE_GIFS)
+let petTimer = null        // 欣赏阶段计时
+let emojiTimer = null      // 创作阶段随机表情
+let streaming = false
+let current = store.newConversation()
+
+Menu.setApplicationMenu(null)
+
+// ===== 透明窗口渲染稳定性修复(必须在 app ready 之前) =====
+// 1) Windows原生窗口遮挡计算会对透明窗口误判"不可见"而停止绘制,
+//    导致GIF动画消失(静态PNG因只绘制一次反而保留)——桌宠项目经典问题
+// 2) 同时关闭后台遮挡跟踪,防止窗口被判定遮挡后动画停止重绘
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion,BackgroundOcclusionTracking')
+// 3) 透明窗口下GIF在部分GPU/驱动上不渲染(加载成功但绘制为空),改用软件合成
+app.disableHardwareAcceleration()
+
+function sendToPet(channel, ...args) {
+  if (petWin && !petWin.isDestroyed()) petWin.webContents.send(channel, ...args)
+}
+function sendToHome(channel, ...args) {
+  if (homeWin && !homeWin.isDestroyed()) homeWin.webContents.send(channel, ...args)
+}
+
+// 诊断日志(渲染进程错误/资源加载失败也记录到这里)
+function logError(text) {
+  try {
+    const fs = require('node:fs')
+    const path = require('node:path')
+    fs.appendFileSync(
+      path.join(app.getPath('userData'), 'error.log'),
+      `[${new Date().toISOString()}] ${text}\n`
+    )
+  } catch { /* 日志失败时静默 */ }
+}
+
+function setPetGif(gif) {
+  petGif = gif
+  sendToPet('pet:state', gif)
+}
+
+function enterIdle() {
+  clearTimeout(petTimer)
+  setPetGif(random(IDLE_GIFS))
+}
+
+function enterAppreciate() {
+  clearTimeout(petTimer)
+  setPetGif(random(APPRECIATE_GIFS))
+  const duration = randInt(10, 60) * 1000
+  petTimer = setTimeout(enterIdle, duration)
+}
+
+// ---------- 桌宠窗口 ----------
+function createPetWindow() {
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize
+  petWin = new BrowserWindow({
+    width: 260,
+    height: 360,
+    x: Math.round(width / 2 - 130),
+    y: Math.round(height / 2 - 180),
+    transparent: true,
+    frame: false,
+    resizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    hasShadow: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false,
+    },
+  })
+  petWin.on('closed', () => { petWin = null })
+  petWin.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    logError(`pet window did-fail-load: ${code} ${desc} ${url}`)
+  })
+  loadPage(petWin, 'pet.html')
+}
+
+// ---------- 主页窗口 ----------
+function createHomeWindow() {
+  // 主页可见期间:桌宠取消置顶(避免遮挡主页/抢焦点)并隐藏桌宠输入框
+  if (petWin && !petWin.isDestroyed()) {
+    petWin.setAlwaysOnTop(false)
+    sendToPet('pet:hideInput')
+  }
+  if (homeWin && !homeWin.isDestroyed()) {
+    homeWin.show()
+    homeWin.focus()
+    return
+  }
+  homeWin = new BrowserWindow({
+    width: 980,
+    height: 680,
+    minWidth: 760,
+    minHeight: 520,
+    title: '蕾米埃尔',
+    backgroundColor: '#ffffff',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  })
+  homeWin.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    logError(`home window did-fail-load: ${code} ${desc} ${url}`)
+  })
+  // 关闭时隐藏,保留对话状态;同时恢复桌宠置顶
+  homeWin.on('close', e => {
+    if (app.quitting) return
+    e.preventDefault()
+    homeWin.hide()
+    if (petWin && !petWin.isDestroyed()) petWin.setAlwaysOnTop(true)
+  })
+  loadPage(homeWin, 'home.html')
+}
+
+function loadPage(win, page) {
+  if (!app.isPackaged && process.env.VITE_DEV_SERVER_URL) {
+    win.loadURL(process.env.VITE_DEV_SERVER_URL + '/' + page)
+  } else {
+    win.loadFile(path.join(__dirname, '../dist/src', page))
+  }
+}
+
+// ---------- 对话 ----------
+function startNewConversation() {
+  if (current.messages.length) store.archive(current)
+  current = store.newConversation()
+  return current
+}
+
+// 提示用户前往设置配置大模型(配置为空或连接失败时)
+let pendingConfigPrompt = false
+function promptGoSettings() {
+  pendingConfigPrompt = true
+  sendToHome('chat:configMissing')
+}
+
+async function handleSend(text) {
+  text = (text || '').trim()
+  if (!text || streaming) return
+  createHomeWindow()
+
+  // 配置检查:模型ID或API key为空时不发起请求
+  if (!settings.isConfigured()) {
+    promptGoSettings()
+    return
+  }
+
+  current.messages.push({ role: 'user', content: text })
+  sendToHome('chat:reset', current)
+
+  streaming = true
+  setPetGif(CREATING_GIF)
+  clearTimeout(petTimer)
+  // 创作过程中随机弹表情
+  clearInterval(emojiTimer)
+  emojiTimer = setInterval(() => sendToPet('pet:emoji', random(EMOJIS)), randInt(2500, 5000))
+
+  let reply = ''
+  try {
+    reply = await streamChat(current.messages, chunk => sendToHome('chat:chunk', chunk), settings.load())
+  } catch (err) {
+    logError(`chat failed: ${err.message || err}`)
+    // 连接失败:提示前往设置
+    sendToHome('chat:done', {})
+    promptGoSettings()
+  } finally {
+    clearInterval(emojiTimer)
+    streaming = false
+    if (reply) {
+      current.messages.push({ role: 'assistant', content: reply })
+      sendToHome('chat:done', {})
+      // 对话完成:创作并完成.gif 播放1秒 -> 欣赏阶段
+      setPetGif(DONE_GIF)
+      petTimer = setTimeout(enterAppreciate, 1000)
+    } else {
+      // 出错时回到空闲
+      enterIdle()
+    }
+  }
+}
+
+// ---------- IPC ----------
+function registerIpc() {
+  // 桌宠右键菜单(原生菜单,避免被小窗口裁剪)
+  ipcMain.on('app:contextmenu', () => {
+    if (!petWin) return
+    const menu = Menu.buildFromTemplate([
+      { label: '对话框', click: () => sendToPet('pet:toggleInput') },
+      { label: '主页', click: () => createHomeWindow() },
+      {
+        label: pinned ? '解除固定' : '固定',
+        click: () => { pinned = !pinned; sendToPet('pet:pinned', pinned) },
+      },
+      { label: '设置', click: () => sendToPet('pet:tip', '该功能正在开发中~') },
+      { label: '退出', click: () => { app.quitting = true; app.quit() } },
+    ])
+    // 弹出在主体右方
+    menu.popup({ window: petWin, x: 262, y: 60 })
+  })
+
+  // 桌宠拖动(未固定时可拖动);高DPI/触摸板下dx/dy为小数,累积后取整,避免抖动和崩溃
+  let accX = 0, accY = 0
+  ipcMain.on('pet:moveBy', (_e, dx, dy) => {
+    if (!petWin || pinned) return
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return
+    accX += dx
+    accY += dy
+    const mx = Math.round(accX)
+    const my = Math.round(accY)
+    if (mx === 0 && my === 0) return
+    accX -= mx
+    accY -= my
+    const [x, y] = petWin.getPosition()
+    petWin.setPosition(x + mx, y + my)
+  })
+
+  ipcMain.handle('chat:send', (_e, text) => handleSend(text))
+  ipcMain.handle('chat:new', () => {
+    if (streaming) return { busy: true }
+    const conv = startNewConversation()
+    sendToHome('chat:reset', conv)
+    return { conversation: conv }
+  })
+  ipcMain.handle('chat:current', () => current)
+  ipcMain.handle('chat:history', () => store.getHistory())
+  ipcMain.handle('chat:load', (_e, id) => {
+    if (streaming) return { busy: true }
+    const conv = store.getConversation(id)
+    if (!conv) return { error: 'not found' }
+    if (current.messages.length && current.id !== id) store.archive(current)
+    current = { ...conv, messages: conv.messages.map(m => ({ ...m })) }
+    sendToHome('chat:reset', current)
+    return { conversation: current }
+  })
+  ipcMain.handle('app:openHome', () => createHomeWindow())
+  ipcMain.handle('app:quit', () => {
+    app.quitting = true
+    app.quit()
+  })
+
+  // 渲染进程诊断上报(资源加载失败等)
+  ipcMain.on('diag:error', (_e, msg) => logError(`[renderer] ${msg}`))
+
+  // 设置:大模型配置读写
+  ipcMain.handle('settings:get', () => settings.load())
+  ipcMain.handle('settings:save', (_e, cfg) => settings.save(cfg || {}))
+
+  // 主页加载晚于事件时的补发标记(如配置缺失提示)
+  ipcMain.handle('chat:promptFlags', () => {
+    const flags = { configMissing: pendingConfigPrompt }
+    pendingConfigPrompt = false
+    return flags
+  })
+}
+
+let pinned = false
+ipcMain.handle('app:setPinned', (_e, v) => { pinned = !!v })
+
+// ---------- 启动 ----------
+// 兜底:主进程未捕获异常只记录日志,不弹崩溃对话框(保证桌宠持续可用)
+process.on('uncaughtException', err => {
+  logError(err.stack || String(err))
+})
+
+const gotLock = app.requestSingleInstanceLock()
+if (!gotLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => createHomeWindow())
+
+  app.whenReady().then(() => {
+    // 启动标记:确认实际运行的构建版本与修复开关
+    logError(`app started | occlusion-fix=on | sw-render=on | electron=${process.versions.electron}`)
+    createPetWindow()
+    registerIpc()
+    // 自动化测试:PET_AUTOTEST=1 时在主进程直接驱动对话链路(密钥经环境变量传入,不进源码)
+    if (!app.isPackaged && process.env.PET_AUTOTEST === '1') {
+      setTimeout(async () => {
+        try {
+          logError('[autotest] === begin ===')
+          settings.save({ model: '', apiKey: '' })
+          logError(`[autotest] T1 clear-config: isConfigured=${settings.isConfigured()} (expect false)`)
+          await handleSend('autotest-no-config')
+          logError(`[autotest] T2 send-unconfigured: pendingPrompt=${pendingConfigPrompt} (expect true) msgs=${current.messages.length} (expect 0)`)
+          pendingConfigPrompt = false
+          const cfg = settings.save({ model: process.env.PET_TEST_MODEL || 'glm-4-flash', apiKey: process.env.PET_TEST_KEY || '' })
+          logError(`[autotest] T3 save-config: model=${cfg.model} keyLen=${cfg.apiKey.length} isConfigured=${settings.isConfigured()} (expect true)`)
+          if (cfg.apiKey) {
+            await handleSend('用一句话打个招呼')
+            const last = current.messages[current.messages.length - 1]
+            logError(`[autotest] T4 send-configured: msgs=${current.messages.length} reply=${JSON.stringify((last && last.content) || '').slice(0, 60)} gif=${petGif}`)
+          } else {
+            logError('[autotest] T4 skipped (no PET_TEST_KEY)')
+          }
+          logError('[autotest] === end ===')
+        } catch (e) {
+          logError(`[autotest] ERROR ${e.stack || e}`)
+        }
+      }, 3000)
+    }
+  })
+
+  app.on('before-quit', () => { app.quitting = true })
+  app.on('window-all-closed', () => {})
+}
