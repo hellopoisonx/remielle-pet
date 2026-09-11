@@ -85,7 +85,7 @@ const FOLLOW = {
   BODY_CX: 130,   // 身体中心在窗内坐标 = CSS(top:60,left:10,240×240)+ 120
   BODY_CY: 180,
 }
-let followEnabled = true  // 右键菜单"跟随光标"开关(与固定一致,不持久化)
+let followEnabled = settings.load().followEnabled  // 光标跟随开关,持久化于 settings.json(默认开启)
 let followable = true     // 状态机允许(启动即空闲,初始true)
 let petHold = false       // 渲染进程在桌宠上按住指针(拖动/点击/右键)
 let menuOpen = false      // 右键菜单打开中
@@ -271,7 +271,7 @@ function registerIpc() {
         label: pinned ? '解除固定' : '固定',
         click: () => { pinned = !pinned; sendToPet('pet:pinned', pinned) },
       },
-      { label: '跟随光标', type: 'checkbox', checked: followEnabled, click: m => { followEnabled = m.checked } },
+      { label: '跟随光标', type: 'checkbox', checked: followEnabled, click: m => { followEnabled = settings.save({ followEnabled: m.checked }).followEnabled } },
       { label: '设置', click: () => sendToPet('pet:tip', '该功能正在开发中~') },
       { label: '退出', click: () => { app.quitting = true; app.quit() } },
     ])
@@ -326,9 +326,13 @@ function registerIpc() {
   // 渲染进程诊断上报(资源加载失败等)
   ipcMain.on('diag:error', (_e, msg) => logError(`[renderer] ${msg}`))
 
-  // 设置:大模型配置读写
+  // 设置:大模型配置与光标跟随开关读写(保存后同步主进程跟随状态)
   ipcMain.handle('settings:get', () => settings.load())
-  ipcMain.handle('settings:save', (_e, cfg) => settings.save(cfg || {}))
+  ipcMain.handle('settings:save', (_e, cfg) => {
+    const saved = settings.save(cfg || {})
+    followEnabled = saved.followEnabled
+    return saved
+  })
 
   // 主页加载晚于事件时的补发标记(如配置缺失提示)
   ipcMain.handle('chat:promptFlags', () => {
@@ -393,6 +397,14 @@ if (!gotLock) {
           followTick({ x: f[0] + 300, y: f[1] })
           logError(`[autotest] T6 follow-guard: dx=${petWin.getPosition()[0] - f[0]} (expect 0)`)
           followable = true
+          // T7: 光标跟随开关持久化(save 合并语义:局部保存不覆盖其它字段)
+          const s1 = settings.save({ followEnabled: false })
+          logError(`[autotest] T7 follow-persist: saved=${s1.followEnabled} loaded=${settings.load().followEnabled} (expect false false)`)
+          const s2 = settings.save({ model: 'glm-4-flash' })
+          logError(`[autotest] T7b follow-merge: model=${s2.model} followEnabled=${s2.followEnabled} (expect glm-4-flash false)`)
+          settings.save({ followEnabled: true })
+          logError(`[autotest] T7c follow-restore: loaded=${settings.load().followEnabled} (expect true)`)
+          followEnabled = true
           logError('[autotest] === end ===')
         } catch (e) {
           logError(`[autotest] ERROR ${e.stack || e}`)
