@@ -1,0 +1,105 @@
+# 蕾米埃尔桌宠(remielle-pet)
+
+可对话的 AI 桌宠软件。基于 Electron + Vue3 构建,桌面悬浮一位动画桌宠"蕾米埃尔",接入智谱云端大模型进行角色扮演对话。纯客户端应用,无自建后端。
+
+## 功能
+
+### 桌宠主体
+- **状态机**:空闲(发呆/思考/欣赏随机)→ 对话中(创作)→ 完成(创作并完成 1 秒)→ 欣赏(欣赏/自豪随机 10~60 秒)→ 回到空闲
+- **左键点击**:主体上方随机弹出表情包(0.5 秒冷却)
+- **右键菜单**(主体右方):对话框(开关桌宠输入框)/ 主页 / 固定(固定后不可拖动)/ 设置(开发中)/ 退出
+- **拖动**:未固定时可左键拖动到任意位置
+- **输入框**:默认隐藏,右键菜单开启;Enter 或点击发送即打开主页开始对话
+
+### 主页
+- 白色简约风格,左侧导航:对话 / 设置 / 关于
+- 对话页:气泡式消息(SSE 流式输出,桌宠头像),左上角"开启新对话",右上角"历史记录"(本地最多 10 条)
+- 设置页:配置大模型(模型ID + API Key,存储在本机)
+
+### 大模型
+- 调用智谱开放平台 API,模型与密钥由用户在设置页自行配置
+- 对话携带系统角色提示词 + 最多 30 条历史消息
+- 配置为空或连接失败时提示"大模型配置读取失败,请前往设置配置",可一键前往设置
+
+## 环境要求
+
+- Node.js ≥ 20
+- npm
+- Windows 10/11(打包目标为 Windows x64)
+
+## 开发运行
+
+```bash
+npm install        # 首次安装依赖
+npm run dev        # 启动开发模式(Vite + Electron)
+```
+
+> 国内网络下 Electron 二进制下载缓慢或失败时,使用镜像:
+> ```bash
+> ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
+> ```
+
+## 打包分发
+
+```bash
+npm run dist       # 构建渲染产物并打包 Windows 安装包(NSIS)
+```
+
+产物输出在 `release/` 目录(安装包 + win-unpacked 免安装目录)。打包下载 Electron 相关二进制同样建议走镜像:
+
+```bash
+ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ \
+ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ \
+npm run dist
+```
+
+安装包未做代码签名,首次运行会触发 Windows SmartScreen 警告,选择"更多信息 → 仍要运行"即可。
+
+## 目录结构
+
+```
+pet-project/
+├─ electron/              # 主进程
+│  ├─ main.js             #   窗口管理、状态机、IPC 注册、自动化测试钩子
+│  ├─ preload.js          #   contextIsolation 安全桥(invoke/send/on)
+│  ├─ config.js           #   常量(API 地址、上下文条数等,不含密钥)
+│  ├─ prompt.js           #   蕾米埃尔角色系统提示词
+│  ├─ settings.js         #   大模型配置读写(userData/settings.json)
+│  ├─ store.js            #   历史对话持久化(userData/data.json)
+│  └─ zhipu.js            #   智谱 API SSE 流式调用
+├─ src/                   # 渲染进程(Vue3)
+│  ├─ pet.html / pet/     #   桌宠窗口(透明无边框置顶)
+│  ├─ home.html / home/   #   主页窗口(导航/对话/设置)
+│  ├─ bridge.js           #   渲染进程 IPC 封装
+│  └─ assets/             #   静态资源
+│     ├─ *.gif            #     原始状态动画(源资源)
+│     ├─ webp/*.webp      #     实际使用的动画(见"渲染兼容性说明")
+│     └─ 表情包-*.png     #     表情弹层 / 图标1.png 桌宠头像
+├─ build/icon.png         # 应用图标
+├─ vite.config.js         # 双页面入口 + vite-plugin-electron
+└─ package.json
+```
+
+## 用户数据
+
+| 文件 | 位置 | 内容 |
+|---|---|---|
+| `settings.json` | `%APPDATA%\remielle-pet\` | 模型ID、API Key(本机明文,注意保管) |
+| `data.json` | `%APPDATA%\remielle-pet\` | 历史对话(最多 10 条) |
+| `error.log` | `%APPDATA%\remielle-pet\` | 启动标记与错误记录(排查问题时查看) |
+
+## 渲染兼容性说明
+
+桌宠主体动画使用 **WebP 动图**而非原始 GIF:部分 Windows 环境(GPU 驱动/显示配置)下,Electron 透明窗口存在 GIF 加载成功但不绘制的缺陷(表现为主体透明)。WebP 走独立的解码渲染路径,可稳定显示。`src/assets/*.gif` 为原始源资源,`src/assets/webp/` 为实际引用的转换产物;替换素材后需重新转换(如 `sharp --animated`)并重新打包。
+
+主进程已叠加的透明窗口稳定性开关(勿移除):
+
+- `app.disableHardwareAcceleration()` —— 软件合成
+- `disable-features: CalculateNativeWinOcclusion,BackgroundOcclusionTracking` —— 规避 Windows 遮挡误判停绘
+- 资源加载失败自动重试(0.5s × 6 次)—— 对抗杀软扫描期的瞬时读取失败
+
+## 已知限制
+
+- "设置"中的其余项与"关于"页内容待开发
+- API Key 本地明文存储,分享 `%APPDATA%\remielle-pet\` 目录前请注意脱敏
+- 暂不支持自动更新(electron-updater 需更新服务器,未启用)
